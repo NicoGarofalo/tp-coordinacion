@@ -23,10 +23,12 @@ type AggregationConfig struct {
 }
 
 type Aggregation struct {
-	outputQueue   middleware.Middleware
-	inputExchange middleware.Middleware
-	fruitItemMap  map[string]map[string]fruititem.FruitItem
-	topSize       int
+	outputQueue      middleware.Middleware
+	inputExchange    middleware.Middleware
+	fruitItemMap     map[string]map[string]fruititem.FruitItem
+	topSize          int
+	clientEofCounter map[string]int
+	sumAmount        int
 }
 
 func NewAggregation(config AggregationConfig) (*Aggregation, error) {
@@ -45,10 +47,12 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 	}
 
 	return &Aggregation{
-		outputQueue:   outputQueue,
-		inputExchange: inputExchange,
-		fruitItemMap:  map[string]map[string]fruititem.FruitItem{},
-		topSize:       config.TopSize,
+		outputQueue:      outputQueue,
+		inputExchange:    inputExchange,
+		fruitItemMap:     map[string]map[string]fruititem.FruitItem{},
+		topSize:          config.TopSize,
+		clientEofCounter: map[string]int{},
+		sumAmount:        config.SumAmount,
 	}, nil
 }
 
@@ -68,8 +72,12 @@ func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func()
 	}
 
 	if isEof {
-		if err := aggregation.handleEndOfRecordsMessage(clientId); err != nil {
-			slog.Error("While handling end of record message", "err", err)
+		aggregation.clientEofCounter[clientId]++
+		if aggregation.clientEofCounter[clientId] >= aggregation.sumAmount {
+			// Ya tengo todos los EOF de todos los nodos
+			if err := aggregation.handleEndOfRecordsMessage(clientId); err != nil {
+				slog.Error("While handling end of record message", "err", err)
+			}
 		}
 		return
 	}
@@ -101,6 +109,10 @@ func (aggregation *Aggregation) handleEndOfRecordsMessage(clientId string) error
 		slog.Debug("While sending EOF message", "err", err)
 		return err
 	}
+
+	// Ya puedo borrar el clientid de los eof y de fruit item map
+	delete(aggregation.clientEofCounter, clientId)
+	delete(aggregation.fruitItemMap, clientId)
 	return nil
 }
 

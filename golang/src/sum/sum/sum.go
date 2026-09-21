@@ -20,10 +20,20 @@ type SumConfig struct {
 	AggregationPrefix string
 }
 
+type InputMessage struct {
+	message      middleware.Message
+	ack          func()
+	nack         func()
+	isControlMsg bool
+}
+
 type Sum struct {
-	inputQueue     middleware.Middleware
-	outputExchange middleware.Middleware
-	fruitItemMap   map[string]map[string]fruititem.FruitItem
+	inputQueue      middleware.Middleware
+	outputExchange  middleware.Middleware
+	controlExchange middleware.Middleware
+	messagesChan    chan InputMessage
+	clientsEof      map[string]bool
+	fruitItemMap    map[string]map[string]fruititem.FruitItem
 }
 
 func NewSum(config SumConfig) (*Sum, error) {
@@ -45,23 +55,44 @@ func NewSum(config SumConfig) (*Sum, error) {
 		return nil, err
 	}
 
+	controlKeys := []string{"control"}
+	controlExchange, err := middleware.CreateExchangeMiddleware(config.SumPrefix, controlKeys, connSettings)
+	if err != nil {
+		inputQueue.Close()
+		outputExchange.Close()
+		return nil, err
+	}
+
+	messagesChan := make(chan InputMessage)
+
 	return &Sum{
-		inputQueue:     inputQueue,
-		outputExchange: outputExchange,
-		fruitItemMap:   map[string]map[string]fruititem.FruitItem{},
+		inputQueue:      inputQueue,
+		outputExchange:  outputExchange,
+		controlExchange: controlExchange,
+		messagesChan:    messagesChan,
+		clientsEof:      map[string]bool{},
+		fruitItemMap:    map[string]map[string]fruititem.FruitItem{},
 	}, nil
 }
 
 func (sum *Sum) Run() {
-	sum.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
-		sum.handleMessage(msg, ack, nack)
+	// Consumo del exchange de control entre sums. Me va a avisar otro sum si ya no hay mas mensajes
+	go sum.controlExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+		sum.messagesChan <- InputMessage{message: msg, ack: ack, nack: nack, isControlMsg: true}
 	})
+
+	go sum.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
+		sum.messagesChan <- InputMessage{message: msg, ack: ack, nack: nack, isControlMsg: false}
+	})
+
+	for inputMessage := range sum.messagesChan {
+		sum.handleMessage(inputMessage)
+	}
 }
 
-func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
-	defer ack()
-
-	clientId, fruitRecords, isEof, err := inner.DeserializeMessage(&msg)
+func (sum *Sum) handleMessage(im InputMessage) {
+	defer im.ack()
+	clientId, fruitRecords, isEof, err := inner.DeserializeMessage(&im.message)
 	if err != nil {
 		slog.Error("While deserializing message", "err", err)
 		return
@@ -70,6 +101,13 @@ func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
 	if isEof {
 		if err := sum.handleEndOfRecordMessage(clientId); err != nil {
 			slog.Error("While handling end of record message", "err", err)
+		}
+		if !im.isControlMsg {
+			// Me llego desde la inputQueue un eof y debo avisar a los demas sums
+			if err := sum.controlExchange.Send(im.message); err != nil {
+				slog.Error("While sending message", "err", err)
+				return
+			}
 		}
 		return
 	}
@@ -80,7 +118,12 @@ func (sum *Sum) handleMessage(msg middleware.Message, ack func(), nack func()) {
 }
 
 func (sum *Sum) handleEndOfRecordMessage(clientId string) error {
+	// Si recibi otro eof del mismo cliente lo ignoro
+	if sum.clientsEof[clientId] {
+		return nil
+	}
 	slog.Info("Received End Of Records message", "clientId", clientId)
+	sum.clientsEof[clientId] = true
 	for key := range sum.fruitItemMap[clientId] {
 		fruitRecord := []fruititem.FruitItem{sum.fruitItemMap[clientId][key]}
 		message, err := inner.SerializeMessage(clientId, fruitRecord)
@@ -104,6 +147,7 @@ func (sum *Sum) handleEndOfRecordMessage(clientId string) error {
 		slog.Debug("While sending EOF message", "err", err)
 		return err
 	}
+	delete(sum.fruitItemMap, clientId)
 	return nil
 }
 
