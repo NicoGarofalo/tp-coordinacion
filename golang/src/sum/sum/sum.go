@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
@@ -33,6 +36,7 @@ type Sum struct {
 	outputExchanges   []middleware.Middleware
 	controlExchange   middleware.Middleware
 	messagesChan      chan InputMessage
+	doneChan          chan struct{}
 	aggregationAmount int
 	clientsEof        map[string]bool
 	fruitItemMap      map[string]map[string]fruititem.FruitItem
@@ -66,12 +70,14 @@ func NewSum(config SumConfig) (*Sum, error) {
 	}
 
 	messagesChan := make(chan InputMessage)
+	doneChan := make(chan struct{})
 
 	return &Sum{
 		inputQueue:        inputQueue,
 		outputExchanges:   outputExchanges,
 		controlExchange:   controlExchange,
 		messagesChan:      messagesChan,
+		doneChan:          doneChan,
 		aggregationAmount: config.AggregationAmount,
 		clientsEof:        map[string]bool{},
 		fruitItemMap:      map[string]map[string]fruititem.FruitItem{},
@@ -81,16 +87,41 @@ func NewSum(config SumConfig) (*Sum, error) {
 func (sum *Sum) Run() {
 	// Consumo del exchange de control entre sums. Me va a avisar otro sum si ya no hay mas mensajes
 	go sum.controlExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
-		sum.messagesChan <- InputMessage{message: msg, ack: ack, nack: nack, isControlMsg: true}
+		inputMessage := InputMessage{message: msg, ack: ack, nack: nack, isControlMsg: true}
+		select {
+		case sum.messagesChan <- inputMessage:
+		case <-sum.doneChan:
+			return
+		}
 	})
 
 	go sum.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
-		sum.messagesChan <- InputMessage{message: msg, ack: ack, nack: nack, isControlMsg: false}
+		inputMessage := InputMessage{message: msg, ack: ack, nack: nack, isControlMsg: false}
+		select {
+		case sum.messagesChan <- inputMessage:
+		case <-sum.doneChan:
+			return
+		}
 	})
 
-	for inputMessage := range sum.messagesChan {
-		sum.handleMessage(inputMessage)
+	go sum.handleSignals()
+
+	for {
+		select {
+		case inputMessage := <-sum.messagesChan:
+			sum.handleMessage(inputMessage)
+		case <-sum.doneChan:
+			return
+		}
 	}
+}
+
+func (sum *Sum) handleSignals() {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	<-signals
+	slog.Info("SIGTERM signal received")
+	sum.closeConnections()
 }
 
 func (sum *Sum) hashFruit(fruitName string) uint32 {
@@ -186,4 +217,31 @@ func (sum *Sum) handleDataMessage(clientId string, fruitRecords []fruititem.Frui
 		}
 	}
 	return nil
+}
+
+func (sum *Sum) closeConnections() {
+	err := sum.inputQueue.StopConsuming()
+	if err != nil {
+		slog.Error("While stopping consuming", "err", err)
+	}
+	err = sum.inputQueue.Close()
+	if err != nil {
+		slog.Error("While closing queue", "err", err)
+	}
+	err = sum.controlExchange.StopConsuming()
+	if err != nil {
+		slog.Error("While stopping consuming", "err", err)
+	}
+	err = sum.controlExchange.Close()
+	if err != nil {
+		slog.Error("While closing exchange", "err", err)
+	}
+	for _, outputExchange := range sum.outputExchanges {
+		err = outputExchange.Close()
+		if err != nil {
+			slog.Error("While closing exchange", "err", err)
+		}
+	}
+
+	close(sum.doneChan)
 }

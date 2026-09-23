@@ -2,7 +2,10 @@ package join
 
 import (
 	"log/slog"
+	"os"
+	"os/signal"
 	"sort"
+	"syscall"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
@@ -26,7 +29,7 @@ type Join struct {
 	outputQueue       middleware.Middleware
 	clientEofCounter  map[string]int
 	aggregationAmount int
-	fruitItems        map[string]map[string]fruititem.FruitItem
+	fruitItems        map[string][]fruititem.FruitItem
 	topSize           int
 }
 
@@ -49,15 +52,24 @@ func NewJoin(config JoinConfig) (*Join, error) {
 		outputQueue:       outputQueue,
 		clientEofCounter:  map[string]int{},
 		aggregationAmount: config.AggregationAmount,
-		fruitItems:        map[string]map[string]fruititem.FruitItem{},
+		fruitItems:        map[string][]fruititem.FruitItem{},
 		topSize:           config.TopSize,
 	}, nil
 }
 
 func (join *Join) Run() {
+	go join.handleSignals()
 	join.inputQueue.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 		join.handleMessage(msg, ack, nack)
 	})
+}
+
+func (join *Join) handleSignals() {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	<-signals
+	slog.Info("SIGTERM signal received")
+	join.closeConnections()
 }
 
 func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func()) {
@@ -92,28 +104,32 @@ func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func())
 
 func (join *Join) addFruitItems(clientId string, fruitRecords []fruititem.FruitItem) {
 	// Voy acumulando los resultados de los aggregators
-	// Si no existe un mapa para este cliente, lo creo
-	if _, ok := join.fruitItems[clientId]; !ok {
-		join.fruitItems[clientId] = make(map[string]fruititem.FruitItem)
-	}
-	for _, fruitRecord := range fruitRecords {
-		if _, ok := join.fruitItems[clientId][fruitRecord.Fruit]; ok {
-			join.fruitItems[clientId][fruitRecord.Fruit] = join.fruitItems[clientId][fruitRecord.Fruit].Sum(fruitRecord)
-		} else {
-			join.fruitItems[clientId][fruitRecord.Fruit] = fruitRecord
-		}
-	}
+	join.fruitItems[clientId] = append(join.fruitItems[clientId], fruitRecords...)
 }
 
 func (join *Join) getTopKFruitItems(clientId string) []fruititem.FruitItem {
 	// analogo al de aggregator
-	fruitItems := make([]fruititem.FruitItem, 0, len(join.fruitItems[clientId]))
-	for _, item := range join.fruitItems[clientId] {
-		fruitItems = append(fruitItems, item)
-	}
+	fruitItems := join.fruitItems[clientId]
+
 	sort.SliceStable(fruitItems, func(i, j int) bool {
 		return fruitItems[j].Less(fruitItems[i])
 	})
+
 	finalTopSize := min(join.topSize, len(fruitItems))
 	return fruitItems[:finalTopSize]
+}
+
+func (join *Join) closeConnections() {
+	err := join.inputQueue.StopConsuming()
+	if err != nil {
+		slog.Error("While stopping consuming", "err", err)
+	}
+	err = join.inputQueue.Close()
+	if err != nil {
+		slog.Error("While closing queue", "err", err)
+	}
+	err = join.outputQueue.Close()
+	if err != nil {
+		slog.Error("While closing queue", "err", err)
+	}
 }
