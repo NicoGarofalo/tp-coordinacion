@@ -3,7 +3,10 @@ package aggregation
 import (
 	"fmt"
 	"log/slog"
+	"os"
+	"os/signal"
 	"sort"
+	"syscall"
 
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/fruititem"
 	"github.com/7574-sistemas-distribuidos/tp-coordinacion/common/messageprotocol/inner"
@@ -57,39 +60,48 @@ func NewAggregation(config AggregationConfig) (*Aggregation, error) {
 }
 
 func (aggregation *Aggregation) Run() {
+	go aggregation.handleSignals()
 	aggregation.inputExchange.StartConsuming(func(msg middleware.Message, ack, nack func()) {
 		aggregation.handleMessage(msg, ack, nack)
 	})
 }
 
+func (aggregation *Aggregation) handleSignals() {
+	signals := make(chan os.Signal, 1)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	<-signals
+	slog.Info("SIGTERM signal received")
+	aggregation.closeConnections()
+}
+
 func (aggregation *Aggregation) handleMessage(msg middleware.Message, ack func(), nack func()) {
 	defer ack()
 
-	clientId, fruitRecords, isEof, err := inner.DeserializeMessage(&msg)
+	messageType, msgData, err := inner.DeserializeMessage(&msg)
 	if err != nil {
 		slog.Error("While deserializing message", "err", err)
 		return
 	}
 
-	if isEof {
-		aggregation.clientEofCounter[clientId]++
-		if aggregation.clientEofCounter[clientId] >= aggregation.sumAmount {
+	if messageType == inner.Eof {
+		aggregation.clientEofCounter[msgData.ClientId]++
+		if aggregation.clientEofCounter[msgData.ClientId] >= aggregation.sumAmount {
 			// Ya tengo todos los EOF de todos los nodos
-			if err := aggregation.handleEndOfRecordsMessage(clientId); err != nil {
+			if err := aggregation.handleEndOfRecordsMessage(msgData.ClientId); err != nil {
 				slog.Error("While handling end of record message", "err", err)
 			}
 		}
 		return
 	}
 
-	aggregation.handleDataMessage(clientId, fruitRecords)
+	aggregation.handleDataMessage(msgData.ClientId, msgData.FruitRecords)
 }
 
 func (aggregation *Aggregation) handleEndOfRecordsMessage(clientId string) error {
 	slog.Info("Received End Of Records message")
 
 	fruitTopRecords := aggregation.buildFruitTop(clientId)
-	message, err := inner.SerializeMessage(clientId, fruitTopRecords)
+	message, err := inner.SerializeMessage(clientId, inner.AggregatedFruits, fruitTopRecords)
 	if err != nil {
 		slog.Debug("While serializing top message", "err", err)
 		return err
@@ -100,7 +112,7 @@ func (aggregation *Aggregation) handleEndOfRecordsMessage(clientId string) error
 	}
 
 	eofMessage := []fruititem.FruitItem{}
-	message, err = inner.SerializeMessage(clientId, eofMessage)
+	message, err = inner.SerializeMessage(clientId, inner.Eof, eofMessage)
 	if err != nil {
 		slog.Debug("While serializing EOF message", "err", err)
 		return err
@@ -141,4 +153,19 @@ func (aggregation *Aggregation) buildFruitTop(clientId string) []fruititem.Fruit
 	})
 	finalTopSize := min(aggregation.topSize, len(fruitItems))
 	return fruitItems[:finalTopSize]
+}
+
+func (aggregation *Aggregation) closeConnections() {
+	err := aggregation.inputExchange.StopConsuming()
+	if err != nil {
+		slog.Error("While stopping consuming", "err", err)
+	}
+	err = aggregation.inputExchange.Close()
+	if err != nil {
+		slog.Error("While closing exchange", "err", err)
+	}
+	err = aggregation.outputQueue.Close()
+	if err != nil {
+		slog.Error("While closing queue", "err", err)
+	}
 }
