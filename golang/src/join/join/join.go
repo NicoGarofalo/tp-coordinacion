@@ -74,18 +74,18 @@ func (join *Join) handleSignals() {
 
 func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func()) {
 	defer ack()
-	clientId, fruitRecords, isEof, err := inner.DeserializeMessage(&msg)
+	messageType, msgData, err := inner.DeserializeMessage(&msg)
 
 	if err != nil {
 		slog.Error("While deserializing message", "err", err)
 		return
 	}
 
-	if isEof {
-		join.clientEofCounter[clientId]++
-		if join.clientEofCounter[clientId] == join.aggregationAmount {
-			topFruits := join.getTopKFruitItems(clientId)
-			topFruitsMsg, err := inner.SerializeMessage(clientId, topFruits)
+	if messageType == inner.Eof {
+		join.clientEofCounter[msgData.ClientId]++
+		if join.clientEofCounter[msgData.ClientId] == join.aggregationAmount {
+			topFruits := join.getTopKFruitItems(msgData.ClientId)
+			topFruitsMsg, err := inner.SerializeMessage(msgData.ClientId, inner.TopFruits, topFruits)
 			if err != nil {
 				slog.Error("While serializing top", "err", err)
 				return
@@ -94,11 +94,11 @@ func (join *Join) handleMessage(msg middleware.Message, ack func(), nack func())
 				slog.Error("While sending top", "err", err)
 				return
 			}
-			delete(join.clientEofCounter, clientId)
-			delete(join.fruitItems, clientId)
+			delete(join.clientEofCounter, msgData.ClientId)
+			delete(join.fruitItems, msgData.ClientId)
 		}
 	} else {
-		join.addFruitItems(clientId, fruitRecords)
+		join.addFruitItems(msgData.ClientId, msgData.FruitRecords)
 	}
 }
 
