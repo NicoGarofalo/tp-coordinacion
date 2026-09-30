@@ -24,7 +24,7 @@ const (
 	EofFromSum     ControlMessageType = "EOF_FROM_SUM"
 	ProcessedBySum ControlMessageType = "PROCESSED_BY_SUM"
 	Flush          ControlMessageType = "FLUSH"
-	ControlError   ControlMessageType = "CONTROL_ERROR"
+	ControlError   ControlMessageType = "CONTROL_ERROR" // Se usa solo para retornar error
 )
 
 type ProtocolMessage interface {
@@ -104,16 +104,23 @@ type messageTypeHeader struct {
 	Type InternalMessageType
 }
 
+func deserializeMessageType(bytes []byte) (InternalMessageType, error) {
+	var header messageTypeHeader
+	if err := json.Unmarshal(bytes, &header); err != nil {
+		return Error, err
+	}
+	return header.Type, nil
+}
+
 func DeserializeMessage(message *middleware.Message) (InternalMessageType, MessageData, error) {
 	bytes := []byte((*message).Body)
 
-	var header messageTypeHeader
-	// REvisar si esto se puede hacer funcion
-	if err := json.Unmarshal(bytes, &header); err != nil {
+	msgType, err := deserializeMessageType(bytes)
+	if err != nil {
 		return Error, MessageData{}, err
 	}
 
-	if header.Type == Eof {
+	if msgType == Eof {
 		data, err := deserializeJson[EOFMessage](bytes)
 		if err != nil {
 			return Error, MessageData{}, err

@@ -43,9 +43,7 @@ type Sum struct {
 	clientsEof        map[string]bool
 	fruitItemMap      map[string]map[string]fruititem.FruitItem
 	processedCount    map[string]uint32
-	expectedTotal     map[string]uint32
-	processedBySums   map[string]map[int]uint32
-	isCoordinator     map[string]bool
+	coordinator       *Coordinator
 }
 
 func NewSum(config SumConfig) (*Sum, error) {
@@ -91,9 +89,7 @@ func NewSum(config SumConfig) (*Sum, error) {
 		clientsEof:        map[string]bool{},
 		fruitItemMap:      map[string]map[string]fruititem.FruitItem{},
 		processedCount:    map[string]uint32{},
-		expectedTotal:     map[string]uint32{},
-		processedBySums:   map[string]map[int]uint32{},
-		isCoordinator:     map[string]bool{},
+		coordinator:       NewCoordinator(),
 	}, nil
 }
 
@@ -163,7 +159,6 @@ func (sum *Sum) handleControlMessage(im InputMessage) {
 		return
 	}
 
-	// Ignoro mensajes de mi mismo
 	if sumId == sum.id {
 		return
 	}
@@ -181,7 +176,10 @@ func (sum *Sum) handleControlMessage(im InputMessage) {
 		}
 	// Siendo coordinador, me llega la cantidad de frutas procesadas por otro sum (post enviar eof)
 	case inner.ProcessedBySum:
-		sum.coordinatorCheck(clientId, sumId, count)
+		sum.coordinator.saveProcessedBySum(clientId, sumId, count)
+		if sum.coordinator.isTotalProcessed(clientId) {
+			sum.broadcastFlush(clientId)
+		}
 	}
 }
 
@@ -232,12 +230,13 @@ func (sum *Sum) handleMessage(im InputMessage) {
 func (sum *Sum) handleEndOfRecordMessage(clientId string, totalMsgsSent uint32) error {
 	slog.Info("Received End Of Records message", "clientId", clientId)
 	// Me vuelvo coordinador de cierre porque recibi el eof por inputQueue
-	sum.isCoordinator[clientId] = true
 	sum.clientsEof[clientId] = true
 
-	sum.expectedTotal[clientId] = totalMsgsSent
-
-	sum.coordinatorCheck(clientId, sum.id, sum.processedCount[clientId])
+	sum.coordinator.startCoordination(clientId, totalMsgsSent)
+	sum.coordinator.saveProcessedBySum(clientId, sum.id, sum.processedCount[clientId])
+	if sum.coordinator.isTotalProcessed(clientId) {
+		sum.broadcastFlush(clientId)
+	}
 	return nil
 }
 
@@ -261,11 +260,10 @@ func (sum *Sum) handleEofFromSum(clientId string) error {
 
 func (sum *Sum) clearClientProcessedInfo(clientId string) {
 	delete(sum.fruitItemMap, clientId)
-	delete(sum.isCoordinator, clientId)
 	delete(sum.clientsEof, clientId)
-	delete(sum.expectedTotal, clientId)
-	delete(sum.processedBySums, clientId)
 	delete(sum.processedCount, clientId)
+
+	sum.coordinator.clearClientProcessedInfo(clientId)
 }
 
 func (sum *Sum) handleFlushFromSum(clientId string) error {
@@ -276,6 +274,8 @@ func (sum *Sum) handleFlushFromSum(clientId string) error {
 			slog.Debug("While serializing message", "err", err)
 			return err
 		}
+		// hasheo el id de la fruta y le aplico modulo para que quede dentro
+		// del rango de los ids de los aggregators
 		aggregatorId := sum.hashFruit(key) % uint32(sum.aggregationAmount)
 		if err := sum.outputExchanges[aggregatorId].Send(*message); err != nil {
 			slog.Debug("While sending message", "err", err)
@@ -297,37 +297,21 @@ func (sum *Sum) handleFlushFromSum(clientId string) error {
 	return nil
 }
 
-func (sum *Sum) coordinatorCheck(clientId string, sumId int, processedCount uint32) {
-	if !sum.isCoordinator[clientId] {
+func (sum *Sum) broadcastFlush(clientId string) {
+	ctrlMsg, err := inner.SerializeControlMessage(sum.id, clientId, inner.Flush)
+	if err != nil {
+		slog.Error("While serializing message", "err", err)
 		return
 	}
-	if _, ok := sum.processedBySums[clientId]; !ok {
-		sum.processedBySums[clientId] = map[int]uint32{}
+	// Le envio la orden de flushear a los sums
+	if err := sum.controlExchange.Send(*ctrlMsg); err != nil {
+		slog.Error("While sending message", "err", err)
+		return
 	}
-	sum.processedBySums[clientId][sumId] = processedCount
-
-	if sum.expectedTotal[clientId] != 0 {
-		totalProcessed := uint32(0)
-		for _, processedCount := range sum.processedBySums[clientId] {
-			totalProcessed += processedCount
-		}
-		if totalProcessed == sum.expectedTotal[clientId] {
-			ctrlMsg, err := inner.SerializeControlMessage(sum.id, clientId, inner.Flush)
-			if err != nil {
-				slog.Error("While serializing message", "err", err)
-				return
-			}
-			// Le envio la orden de flushear a los sums
-			if err := sum.controlExchange.Send(*ctrlMsg); err != nil {
-				slog.Error("While sending message", "err", err)
-				return
-			}
-			// Flushea el coordinador como cualquier sum
-			if err := sum.handleFlushFromSum(clientId); err != nil {
-				slog.Error("While sending message", "err", err)
-				return
-			}
-		}
+	// Flushea el coordinador como cualquier sum
+	if err := sum.handleFlushFromSum(clientId); err != nil {
+		slog.Error("While sending message", "err", err)
+		return
 	}
 }
 
