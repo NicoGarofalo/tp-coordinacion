@@ -60,4 +60,4 @@ La escalabilidad por clientes está contemplada porque todos los mensajes enviad
 
 - El principal problema de la implementación actual es que el coordinador es un _single point of failure_ en caso de caída de nodo. Sin embargo, implementar las mismas comunicaciones pero con todos los sums implicaba una sobrecarga de mensajes que consideré menos performante que la actual. Implementar un algoritmo de reasignación de coordinador en base a caída también es una solución, aunque la consideré fuera de scope para el TP.
 - También se podría mejorar un poco más el protocolo interno (`inner.go`) debido a que, si bien se mejoraron las serializaciones, 
-- Se podría cambiar la implementación del middleware para que el sum pueda enviar mensajes a un aggregator o un sum específico, como por ejemplo hacer un SendTo.
+- Se podría cambiar la implementación del middleware para que el sum pueda enviar mensajes a un aggregator o un sum específico, como por ejemplo hacer un SendTo. Esto también reduciría la cantidad de conexiones para middlewares creadas.
